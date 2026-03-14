@@ -73,11 +73,20 @@ class SalesAPIController(http.Controller):
         return country.id if country else False, state.id if state else False
 
     # -------------------------------------------------------------------------
-    # HELPER: Buscar impuesto IVA 16% incluido en precio
+    # HELPER: Obtener impuesto IVA 16% con precio incluido
     # -------------------------------------------------------------------------
     def _get_tax_included(self, company):
+        """
+        Busca el IVA 16% de ventas existente en la compañía.
+        Si ya tiene price_include=True, lo usa directo.
+        Si no, busca el IVA 16% normal y le calcula el precio
+        manualmente en la línea (no modifica el impuesto existente).
+        
+        NO crea impuestos nuevos. Usa el que ya existe.
+        """
         Tax = request.env['account.tax'].sudo()
 
+        # 1. Buscar IVA 16% con price_include ya activado
         tax = Tax.search([
             ('type_tax_use', '=', 'sale'),
             ('amount', '=', 16.0),
@@ -85,27 +94,24 @@ class SalesAPIController(http.Controller):
             ('company_id', '=', company.id),
         ], limit=1)
 
-        if not tax:
-            base_tax = Tax.search([
-                ('type_tax_use', '=', 'sale'),
-                ('amount', '=', 16.0),
-                ('price_include', '=', False),
-                ('company_id', '=', company.id),
-            ], limit=1)
+        if tax:
+            return tax
 
-            tax = Tax.create({
-                'name': 'IVA 16% (Incluido en Precio) - Web',
-                'type_tax_use': 'sale',
-                'amount_type': 'percent',
-                'amount': 16.0,
-                'price_include': True,
-                'include_base_amount': False,
-                'company_id': company.id,
-                'tax_group_id': base_tax.tax_group_id.id if base_tax and base_tax.tax_group_id else False,
-            })
-            _logger.info(f"API Sales: Created tax-included IVA: {tax.name} (id={tax.id})")
+        # 2. No hay uno con price_include, buscar el IVA 16% normal
+        tax = Tax.search([
+            ('type_tax_use', '=', 'sale'),
+            ('amount', '=', 16.0),
+            ('company_id', '=', company.id),
+        ], limit=1)
 
-        return tax
+        if tax:
+            # Retornamos el impuesto normal. El precio se ajustará
+            # en la línea de pedido dividiendo entre 1.16
+            return tax
+
+        # 3. No hay ningún IVA 16% — esto no debería pasar en México
+        _logger.warning("API Sales: No IVA 16% tax found for company %s", company.name)
+        return False
 
     # -------------------------------------------------------------------------
     # ENDPOINT: CREAR ORDEN
@@ -220,7 +226,7 @@ class SalesAPIController(http.Controller):
             Product = request.env['product.product'].sudo()
 
             company = request.env.company
-            tax_included = self._get_tax_included(company)
+            tax = self._get_tax_included(company)
 
             order_lines = []
 
@@ -244,15 +250,30 @@ class SalesAPIController(http.Controller):
                             'list_price': 0.0
                         })
 
-                price_with_tax = item.get('price_unit', 0.0)
+                # El precio de Stripe YA incluye IVA.
+                # Si el impuesto tiene price_include=True, Odoo lo desglosa solo.
+                # Si el impuesto NO tiene price_include, debemos dividir entre 1.16
+                # para que Odoo sume el 16% y el total coincida.
+                price_from_stripe = item.get('price_unit', 0.0)
 
-                order_lines.append((0, 0, {
+                if tax and not tax.price_include:
+                    # Impuesto normal (no incluido): extraer base
+                    price_unit = round(price_from_stripe / 1.16, 2)
+                else:
+                    # Impuesto con precio incluido o sin impuesto: usar tal cual
+                    price_unit = price_from_stripe
+
+                line_vals = {
                     'product_id': product.id,
                     'name': item.get('product_name') or product.name,
                     'product_uom_qty': item.get('quantity', 1),
-                    'price_unit': price_with_tax,
-                    'tax_ids': [(6, 0, [tax_included.id])],
-                }))
+                    'price_unit': price_unit,
+                }
+
+                if tax:
+                    line_vals['tax_ids'] = [(6, 0, [tax.id])]
+
+                order_lines.append((0, 0, line_vals))
 
             # 6. Crear Orden de Venta
             order = SaleOrder.create({
