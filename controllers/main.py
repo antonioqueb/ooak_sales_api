@@ -251,7 +251,7 @@ class SalesAPIController(http.Controller):
                     'name': item.get('product_name') or product.name,
                     'product_uom_qty': item.get('quantity', 1),
                     'price_unit': price_with_tax,
-                    'tax_id': [(6, 0, [tax_included.id])],
+                    'tax_ids': [(6, 0, [tax_included.id])],
                 }))
 
             # 6. Crear Orden de Venta
